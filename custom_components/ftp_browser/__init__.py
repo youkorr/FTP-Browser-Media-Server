@@ -4,7 +4,6 @@ import logging
 import json
 import time
 import voluptuous as vol
-import aioftp
 import asyncio
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.config_entries import ConfigEntry
@@ -14,7 +13,9 @@ from homeassistant.helpers.event import async_track_time_interval
 from datetime import timedelta
 from homeassistant.components.http import HomeAssistantView
 from aiohttp import web
+import mimetypes
 
+from .ftp_client import FTPClient
 from .const import (
     DOMAIN, 
     CONF_FTP_SERVER, 
@@ -169,26 +170,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "client": None
     }
     
+    entry_data = hass.data[DOMAIN]["entries"][entry.entry_id]
+    
     # Create a connection to test and cache
     try:
-        client = aioftp.Client()
-        await client.connect(
-            entry.data[CONF_FTP_SERVER],
-            entry.data.get(CONF_PORT, 21),
-            ssl=entry.data.get(CONF_SSL, False)
-        )
-        await client.login(
-            entry.data[CONF_USERNAME],
-            entry.data[CONF_PASSWORD]
+        # Utiliser le client FTP direct au lieu de aioftp
+        client = FTPClient(
+            entry_data["server"],
+            entry_data.get("port", 21),
+            timeout=30
         )
         
-        hass.data[DOMAIN]["entries"][entry.entry_id]["client"] = client
-        _LOGGER.info(f"Successfully connected to FTP server: {entry.data[CONF_FTP_SERVER]}")
+        if client.connect() and client.login(
+            entry_data["username"],
+            entry_data["password"]
+        ):
+            hass.data[DOMAIN]["entries"][entry.entry_id]["client"] = client
+            _LOGGER.info(f"Successfully connected to FTP server: {entry_data['server']}")
+        else:
+            _LOGGER.error(f"Failed to connect to FTP server: {entry_data['server']}")
+            client.close()
+            hass.data[DOMAIN]["entries"][entry.entry_id]["client"] = None
     except Exception as e:
         _LOGGER.error(f"Failed to connect to FTP server: {e}")
-        # Don't keep the client in a broken state
         hass.data[DOMAIN]["entries"][entry.entry_id]["client"] = None
-        # Connection failed, but we'll still set up the platforms and retry later
     
     for platform in PLATFORMS:
         hass.async_create_task(
@@ -202,10 +207,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Close FTP connection if open
     client = hass.data[DOMAIN]["entries"].get(entry.entry_id, {}).get("client")
     if client:
-        try:
-            await client.quit()
-        except Exception as e:
-            _LOGGER.warning(f"Error closing FTP connection: {e}")
+        client.close()
     
     # Unload platforms
     unload_ok = all(
@@ -243,58 +245,40 @@ class FTPListView(HomeAssistantView):
         
         if client:
             try:
-                # Test if connection is still active
-                await client.command("NOOP")
-                need_to_connect = False
+                # Test if connection is still active with a simple command
+                client._send_command("NOOP")
+                response = client._read_response()
+                if response.startswith("200"):
+                    need_to_connect = False
+                else:
+                    client.close()
+                    client = None
             except Exception:
                 # Connection lost, reconnect
-                try:
-                    await client.quit()
-                except Exception:
-                    pass
+                client.close()
                 client = None
         
         if need_to_connect:
             try:
-                client = aioftp.Client()
-                await client.connect(
+                client = FTPClient(
                     entry_data["server"],
                     entry_data["port"],
-                    ssl=entry_data["ssl"]
+                    timeout=30
                 )
-                await client.login(
+                
+                if not (client.connect() and client.login(
                     entry_data["username"],
                     entry_data["password"]
-                )
+                )):
+                    return self.json_message("Failed to connect to FTP server", 502)
+                    
                 entry_data["client"] = client
             except Exception as e:
                 return self.json_message(f"Failed to connect to FTP server: {str(e)}", 502)
         
         try:
-            # Navigate to the requested path
-            if path != '/':
-                await client.change_directory(path)
-            
-            # List files and directories
-            file_list = []
-            async for info in client.list():
-                is_dir = info["type"] == "dir"
-                file_path = f"{path}/{info['name']}" if path == '/' else f"{path}/{info['name']}"
-                file_path = file_path.replace('//', '/')
-                
-                file_info = {
-                    "name": info["name"],
-                    "path": file_path,
-                    "type": "directory" if is_dir else "file",
-                    "size": info.get("size", 0),
-                    "modified": info.get("modify", None)
-                }
-                
-                # For directories, add a trailing slash for clarity
-                if is_dir and not file_path.endswith("/"):
-                    file_info["path"] = f"{file_path}/"
-                
-                file_list.append(file_info)
+            # List files and directories directly using our FTP client
+            file_list = client.list_directory(path)
             
             # Sort: directories first, then files, all alphabetically
             file_list.sort(key=lambda x: (x["type"] != "directory", x["name"].lower()))
@@ -335,18 +319,19 @@ class FTPDownloadView(HomeAssistantView):
         entry_data = hass.data[DOMAIN]["entries"][entry_id]
         
         # Create a new FTP connection for downloading
-        # It's better to use a separate connection for downloads to not interfere with browsing
         try:
-            client = aioftp.Client()
-            await client.connect(
+            client = FTPClient(
                 entry_data["server"],
                 entry_data["port"],
-                ssl=entry_data["ssl"]
+                timeout=60  # Longer timeout for downloads
             )
-            await client.login(
+            
+            if not (client.connect() and client.login(
                 entry_data["username"],
                 entry_data["password"]
-            )
+            )):
+                return self.json_message("Failed to connect to FTP server", 502)
+                
         except Exception as e:
             _LOGGER.error(f"Failed to connect to FTP server for download: {e}")
             return self.json_message(f"Server connection error: {str(e)}", 502)
@@ -363,55 +348,37 @@ class FTPDownloadView(HomeAssistantView):
             response.headers["Content-Type"] = content_type
             response.headers["Content-Disposition"] = f'attachment; filename="{file_name}"'
             
+            # Get file size if possible
+            file_size = client.get_file_size(path)
+            if file_size:
+                response.headers["Content-Length"] = str(file_size)
+            
             # Start streaming response
             await response.prepare(request)
             
-            # Get file size if possible
-            try:
-                file_size = await self._get_file_size(client, path)
-                if file_size:
-                    response.headers["Content-Length"] = str(file_size)
-            except Exception as e:
-                _LOGGER.warning(f"Could not determine file size: {e}")
-            
             # Download and stream the file
-            stream = await client.download_stream(path)
-            
-            async for chunk in stream.iter_by_block(8192):
+            for chunk in client.download_file(path):
                 await response.write(chunk)
+                # Small pause to allow other tasks to run
+                await asyncio.sleep(0.001)
             
             await response.write_eof()
-            await client.quit()
+            client.close()
             
             return response
             
         except Exception as e:
             _LOGGER.error(f"Error downloading file: {e}")
             try:
-                await client.quit()
+                client.close()
             except Exception:
                 pass
             return self.json_message(f"Error downloading file: {str(e)}", 500)
     
     def _guess_mime_type(self, filename):
         """Guess the MIME type based on file extension."""
-        import mimetypes
         mime_type, _ = mimetypes.guess_type(filename)
         return mime_type or "application/octet-stream"
-    
-    async def _get_file_size(self, client, path):
-        """Get the file size if possible."""
-        dir_path = os.path.dirname(path)
-        file_name = os.path.basename(path)
-        
-        if dir_path:
-            await client.change_directory(dir_path)
-        
-        async for info in client.list():
-            if info["name"] == file_name:
-                return info.get("size")
-        
-        return None
 
 class FTPShareView(HomeAssistantView):
     """View to handle FTP share link creation."""
