@@ -1,0 +1,37 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "FTP Server Connection",
+        "description": "Set up a connection to your FTP server.",
+        "data": {
+          "ftp_server": "FTP Server hostname or IP",
+          "username": "Username",
+          "password": "Password",
+          "port": "Port (usually 21)",
+          "ssl": "Use SSL/TLS",
+          "scan_interval": "Scan interval in seconds"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the FTP server",
+      "invalid_auth": "Invalid username or password",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "This FTP server is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "FTP Browser Options",
+        "data": {
+          "scan_interval": "Scan interval in seconds",
+          "ssl": "Use SSL/TLS connection"
+        }
+      }
+    }
+  }
+}
