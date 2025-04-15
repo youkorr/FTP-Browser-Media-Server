@@ -16,14 +16,14 @@ from homeassistant.components.media_source import (
     MEDIA_CLASS_APP,
     MEDIA_MIME_TYPES,
 )
-import aioftp
 import os
 import logging
 import mimetypes
 import urllib.parse
-import async_timeout
+import asyncio
 
 from .const import DOMAIN
+from .ftp_client import FTPClient  # Utiliser le même client FTP que dans __init__.py
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,13 +48,14 @@ class FTPMediaSource(MediaSource):
         if entry_id not in self.hass.data[DOMAIN]["entries"]:
             raise ValueError(f"Unknown FTP server: {entry_id}")
         
-        # Create a download link that will be valid for 4 hours
+        # Créer un lien de partage qui sera valide pendant 4 heures
         service_data = {
             "entry_id": entry_id,
             "path": path,
             "duration": 4
         }
         
+        # Appeler le service create_share directement
         result = await self.hass.services.async_call(
             DOMAIN, 
             "create_share", 
@@ -63,10 +64,10 @@ class FTPMediaSource(MediaSource):
             return_response=True
         )
         
-        # Get mime type
+        # Déterminer le type MIME
         mime_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
         
-        # Return the URL for direct playback
+        # Retourner l'URL pour la lecture directe
         return PlayMedia(result["url"], mime_type)
     
     async def async_browse_media(self, item: MediaSourceItem) -> BrowseMedia:
@@ -90,6 +91,7 @@ class FTPMediaSource(MediaSource):
             can_expand=True,
             children_media_class=MEDIA_CLASS_APP,
             thumbnail=None,
+            children=[]
         )
         
         # Add each FTP server as a child
@@ -122,28 +124,35 @@ class FTPMediaSource(MediaSource):
         if client:
             try:
                 # Test if connection is still active
-                await client.command("NOOP")
-                need_to_connect = False
+                client._send_command("NOOP")
+                response = client._read_response()
+                if response.startswith("200"):
+                    need_to_connect = False
+                else:
+                    client.close()
+                    client = None
             except Exception:
                 # Connection lost, reconnect
                 try:
-                    await client.quit()
+                    client.close()
                 except Exception:
                     pass
                 client = None
         
         if need_to_connect:
             try:
-                client = aioftp.Client()
-                await client.connect(
+                client = FTPClient(
                     entry_data["server"],
                     entry_data["port"],
-                    ssl=entry_data["ssl"]
+                    timeout=30
                 )
-                await client.login(
+                
+                if not (client.connect() and client.login(
                     entry_data["username"],
                     entry_data["password"]
-                )
+                )):
+                    raise ValueError("Failed to connect to FTP server")
+                    
                 entry_data["client"] = client
             except Exception as e:
                 _LOGGER.error(f"Failed to connect to FTP server: {e}")
@@ -183,9 +192,32 @@ class FTPMediaSource(MediaSource):
             base.children.append(parent)
         
         try:
+            # Get actual path
+            root_path = entry_data.get("root_path", "/")
+            if root_path and root_path != "/":
+                if path == "/":
+                    actual_path = root_path
+                else:
+                    actual_path = os.path.join(root_path, path.lstrip('/'))
+            else:
+                actual_path = path
+                
+            _LOGGER.debug(f"Browsing FTP directory: requested='{path}', actual='{actual_path}'")
+            
             # Navigate to the requested path
-            if path != '/':
-                await client.change_directory(path)
+            if actual_path != '/':
+                try:
+                    client._send_command(f"CWD {actual_path}")
+                    response = client._read_response()
+                    if not response.startswith("250"):
+                        _LOGGER.error(f"Cannot access directory path '{actual_path}': {response}")
+                        raise ValueError(f"Cannot access directory: {response}")
+                except Exception as e:
+                    _LOGGER.error(f"Error accessing directory '{actual_path}': {e}")
+                    raise ValueError(f"Error accessing directory: {str(e)}")
+            
+            # List files and directories
+            file_list = client.list_directory(actual_path)
             
             # List files and directories
             async for info in client.list():
