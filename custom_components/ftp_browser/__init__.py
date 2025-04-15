@@ -67,17 +67,23 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     # Register services
     async def create_share_link(call):
         """Service to create a share link."""
+        # Si aucun entry_id n'est fourni, utiliser le premier disponible
         entry_id = call.data.get("entry_id")
-        path = call.data.get("path")
-        duration = call.data.get("duration", 24)  # hours
+        if not entry_id and hass.data[DOMAIN]["entries"]:
+            # Prendre le premier entry_id disponible
+            entry_id = next(iter(hass.data[DOMAIN]["entries"].keys()))
+            _LOGGER.info(f"Aucun entry_id fourni, utilisation de: {entry_id}")
         
-        if not entry_id or not path:
-            _LOGGER.error("Missing required fields: entry_id and path")
-            return
+        path = call.data.get("path", "/")  # Chemin par défaut: racine
+        duration = call.data.get("duration", 24)  # Durée par défaut: 24 heures
+        
+        if not entry_id:
+            _LOGGER.error("Aucune configuration FTP disponible pour créer un lien de partage")
+            return {"error": "Aucune configuration FTP disponible"}
             
         if entry_id not in hass.data[DOMAIN]["entries"]:
-            _LOGGER.error(f"Unknown config entry: {entry_id}")
-            return
+            _LOGGER.error(f"Config entry inconnue: {entry_id}")
+            return {"error": f"Config entry inconnue: {entry_id}"}
             
         entry_data = hass.data[DOMAIN]["entries"][entry_id]
         
@@ -105,31 +111,35 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         base_url = hass.config.api.base_url
         share_url = f"{base_url}/api/ftp_browser/download/{token}"
         
-        _LOGGER.info(f"Created share link: {share_url}, expires in {duration} hours, path: {full_path}")
+        _LOGGER.info(f"Lien de partage créé: {share_url}, expire dans {duration} heures, chemin: {full_path}")
         return {"url": share_url, "token": token, "expiry": expiry}
     
     async def delete_share_link(call):
         """Service to delete a share link."""
         token = call.data.get("token")
         
+        # Si aucun token n'est fourni, supprimer tous les liens
         if not token:
-            _LOGGER.error("Missing required field: token")
-            return
+            deleted_count = len(hass.data[DOMAIN]["shared_links"])
+            hass.data[DOMAIN]["shared_links"] = {}
+            await store.async_save({"shared_links": {}})
+            _LOGGER.info(f"Tous les liens de partage supprimés ({deleted_count})")
+            return {"success": True, "deleted_count": deleted_count}
             
         if token in hass.data[DOMAIN]["shared_links"]:
             del hass.data[DOMAIN]["shared_links"][token]
             await store.async_save({"shared_links": hass.data[DOMAIN]["shared_links"]})
-            _LOGGER.info(f"Deleted share link with token: {token}")
+            _LOGGER.info(f"Lien de partage supprimé avec token: {token}")
             return {"success": True}
         else:
-            _LOGGER.warning(f"Share link with token {token} not found")
-            return {"success": False, "error": "Token not found"}
+            _LOGGER.warning(f"Lien de partage avec token {token} non trouvé")
+            return {"success": False, "error": "Token non trouvé"}
     
     hass.services.async_register(
         DOMAIN, SERVICE_CREATE_SHARE, create_share_link,
         vol.Schema({
-            vol.Required("entry_id"): str,
-            vol.Required("path"): str,
+            vol.Optional("entry_id"): str,
+            vol.Optional("path"): str,
             vol.Optional("duration"): int,
         })
     )
@@ -137,7 +147,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.services.async_register(
         DOMAIN, SERVICE_DELETE_SHARE, delete_share_link,
         vol.Schema({
-            vol.Required("token"): str,
+            vol.Optional("token"): str,
         })
     )
     
@@ -155,7 +165,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             for token in expired:
                 del shared_links[token]
             await store.async_save({"shared_links": shared_links})
-            _LOGGER.info(f"Cleaned up {len(expired)} expired share links")
+            _LOGGER.info(f"Nettoyage de {len(expired)} liens de partage expirés")
     
     # Schedule periodic cleanup of expired shares
     async_track_time_interval(
@@ -163,6 +173,8 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     )
     
     return True
+
+# Le reste du code reste inchangé
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up FTP Browser from a config entry."""
@@ -452,11 +464,16 @@ class FTPShareView(HomeAssistantView):
             return self.json_message("Invalid JSON", 400)
         
         entry_id = data.get("entry_id")
-        path = data.get("path")
+        # Si aucun entry_id n'est fourni, utiliser le premier disponible
+        if not entry_id and hass.data[DOMAIN]["entries"]:
+            entry_id = next(iter(hass.data[DOMAIN]["entries"].keys()))
+            _LOGGER.info(f"Aucun entry_id fourni dans l'API, utilisation de: {entry_id}")
+            
+        path = data.get("path", "/")
         duration = data.get("duration", 24)  # hours
         
-        if not entry_id or not path:
-            return self.json_message("Missing required fields: entry_id and path", 400)
+        if not entry_id:
+            return self.json_message("Aucune configuration FTP disponible", 400)
             
         if entry_id not in hass.data[DOMAIN]["entries"]:
             return self.json_message(f"Unknown config entry: {entry_id}", 404)
