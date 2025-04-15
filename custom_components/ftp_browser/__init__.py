@@ -522,4 +522,3 @@ class FTPShareView(HomeAssistantView):
             "expiry_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expiry))
         })
 
-
