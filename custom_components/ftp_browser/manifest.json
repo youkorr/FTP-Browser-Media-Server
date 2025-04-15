@@ -1,0 +1,12 @@
+{
+  "domain": "ftp_browser",
+  "name": "FTP Browser & Media Server",
+  "documentation": "https://github.com/votre-nom/ha-ftp-browser",
+  "issue_tracker": "https://github.com/votre-nom/ha-ftp-browser/issues",
+  "dependencies": ["http", "media_source"],
+  "codeowners": ["@youkorr"],
+  "requirements": ["aioftp>=0.21.3"],
+  "config_flow": true,
+  "iot_class": "local_polling",
+  "version": "1.0.0"
+}
