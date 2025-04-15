@@ -24,7 +24,9 @@ from .const import (
     CONF_PORT,
     CONF_SSL,
     CONF_SCAN_INTERVAL,
+    CONF_ROOT_PATH,
     DEFAULT_SCAN_INTERVAL,
+    DEFAULT_ROOT_PATH,
     SERVICE_CREATE_SHARE,
     SERVICE_DELETE_SHARE,
     STORAGE_KEY,
@@ -79,6 +81,10 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             
         entry_data = hass.data[DOMAIN]["entries"][entry_id]
         
+        # Construct full path with root path
+        root_path = entry_data.get("root_path", DEFAULT_ROOT_PATH)
+        full_path = os.path.normpath(os.path.join(root_path, path.lstrip('/')))
+        
         # Generate a unique token
         import uuid
         token = str(uuid.uuid4())
@@ -87,7 +93,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         expiry = time.time() + (duration * 3600)
         hass.data[DOMAIN]["shared_links"][token] = {
             "entry_id": entry_id,
-            "path": path,
+            "path": full_path,
             "expiry": expiry,
             "created": time.time()
         }
@@ -99,7 +105,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
         base_url = hass.config.api.base_url
         share_url = f"{base_url}/api/ftp_browser/download/{token}"
         
-        _LOGGER.info(f"Created share link: {share_url}, expires in {duration} hours")
+        _LOGGER.info(f"Created share link: {share_url}, expires in {duration} hours, path: {full_path}")
         return {"url": share_url, "token": token, "expiry": expiry}
     
     async def delete_share_link(call):
@@ -167,10 +173,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "port": entry.data.get(CONF_PORT, 21),
         "ssl": entry.data.get(CONF_SSL, False),
         "scan_interval": entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL),
+        "root_path": entry.data.get(CONF_ROOT_PATH, DEFAULT_ROOT_PATH),
         "client": None
     }
     
     entry_data = hass.data[DOMAIN]["entries"][entry.entry_id]
+    
+    _LOGGER.info(f"Setting up FTP connection to {entry_data['server']} with root path: {entry_data['root_path']}")
     
     # Create a connection to test and cache
     try:
@@ -185,6 +194,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry_data["username"],
             entry_data["password"]
         ):
+            # Test if we can access the root path
+            root_path = entry_data.get("root_path", DEFAULT_ROOT_PATH)
+            if root_path and root_path != "/":
+                try:
+                    # Try to change to root directory to verify it exists
+                    client._send_command(f"CWD {root_path}")
+                    response = client._read_response()
+                    if not response.startswith("250"):
+                        _LOGGER.error(f"Cannot access root path '{root_path}': {response}")
+                        client.close()
+                        return False
+                    _LOGGER.info(f"Successfully accessed root path: {root_path}")
+                except Exception as e:
+                    _LOGGER.error(f"Error accessing root path '{root_path}': {e}")
+                    client.close()
+                    return False
+            
             hass.data[DOMAIN]["entries"][entry.entry_id]["client"] = client
             _LOGGER.info(f"Successfully connected to FTP server: {entry_data['server']}")
         else:
@@ -237,7 +263,23 @@ class FTPListView(HomeAssistantView):
             return self.json_message(f"Config entry {entry_id} not found", 404)
         
         entry_data = hass.data[DOMAIN]["entries"][entry_id]
-        path = request.query.get("path", "/")
+        
+        # Get the requested path, relative to root
+        requested_path = request.query.get("path", "/")
+        
+        # Combine with root path if configured
+        root_path = entry_data.get("root_path", DEFAULT_ROOT_PATH)
+        
+        # We need to handle paths carefully
+        if root_path and root_path != "/":
+            if requested_path == "/":
+                actual_path = root_path
+            else:
+                actual_path = os.path.normpath(os.path.join(root_path, requested_path.lstrip('/')))
+        else:
+            actual_path = requested_path
+            
+        _LOGGER.debug(f"Listing directory: requested='{requested_path}', actual='{actual_path}'")
         
         # Create or reuse FTP client
         client = entry_data.get("client")
@@ -255,7 +297,10 @@ class FTPListView(HomeAssistantView):
                     client = None
             except Exception:
                 # Connection lost, reconnect
-                client.close()
+                try:
+                    client.close()
+                except Exception:
+                    pass
                 client = None
         
         if need_to_connect:
@@ -278,7 +323,19 @@ class FTPListView(HomeAssistantView):
         
         try:
             # List files and directories directly using our FTP client
-            file_list = client.list_directory(path)
+            file_list = client.list_directory(actual_path)
+            
+            # Transform paths to be relative to the requested path
+            for file in file_list:
+                # Convert actual paths back to virtual paths for the UI
+                if root_path and root_path != "/":
+                    # Strip the root path from the beginning of the file path
+                    file_path = file["path"]
+                    if file_path.startswith(root_path):
+                        rel_path = file_path[len(root_path):]
+                        if not rel_path.startswith('/'):
+                            rel_path = '/' + rel_path
+                        file["path"] = rel_path
             
             # Sort: directories first, then files, all alphabetically
             file_list.sort(key=lambda x: (x["type"] != "directory", x["name"].lower()))
@@ -339,6 +396,7 @@ class FTPDownloadView(HomeAssistantView):
         try:
             # Get file info
             file_name = os.path.basename(path)
+            _LOGGER.debug(f"Downloading file from path: {path}")
             
             # Determine mime type
             content_type = self._guess_mime_type(file_name)
@@ -403,6 +461,24 @@ class FTPShareView(HomeAssistantView):
         if entry_id not in hass.data[DOMAIN]["entries"]:
             return self.json_message(f"Unknown config entry: {entry_id}", 404)
         
+        entry_data = hass.data[DOMAIN]["entries"][entry_id]
+        
+        # Construct full path with root path if needed
+        root_path = entry_data.get("root_path", DEFAULT_ROOT_PATH)
+        full_path = path
+        
+        if root_path and root_path != "/":
+            # Remove leading slash from path if present
+            if path.startswith("/"):
+                path_no_slash = path[1:]
+            else:
+                path_no_slash = path
+                
+            # Join with root path
+            full_path = os.path.join(root_path, path_no_slash)
+        
+        _LOGGER.debug(f"Creating share link for: {path} -> {full_path}")
+        
         # Generate a unique token
         import uuid
         token = str(uuid.uuid4())
@@ -411,7 +487,7 @@ class FTPShareView(HomeAssistantView):
         expiry = time.time() + (duration * 3600)
         hass.data[DOMAIN]["shared_links"][token] = {
             "entry_id": entry_id,
-            "path": path,
+            "path": full_path,
             "expiry": expiry,
             "created": time.time()
         }
@@ -430,4 +506,5 @@ class FTPShareView(HomeAssistantView):
             "expiry": expiry,
             "expiry_human": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expiry))
         })
+
 
