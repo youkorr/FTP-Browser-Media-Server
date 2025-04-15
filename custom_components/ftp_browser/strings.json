@@ -10,13 +10,15 @@
           "password": "Password",
           "port": "Port (usually 21)",
           "ssl": "Use SSL/TLS",
-          "scan_interval": "Scan interval in seconds"
+          "scan_interval": "Scan interval in seconds",
+          "root_path": "Root path (e.g. /sdcard)"
         }
       }
     },
     "error": {
       "cannot_connect": "Failed to connect to the FTP server",
       "invalid_auth": "Invalid username or password",
+      "invalid_path": "Root path does not exist or is not accessible",
       "unknown": "Unexpected error"
     },
     "abort": {
@@ -29,9 +31,16 @@
         "title": "FTP Browser Options",
         "data": {
           "scan_interval": "Scan interval in seconds",
-          "ssl": "Use SSL/TLS connection"
+          "ssl": "Use SSL/TLS connection",
+          "root_path": "Root path (e.g. /sdcard)"
         }
       }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the FTP server",
+      "invalid_auth": "Invalid username or password",
+      "invalid_path": "Root path does not exist or is not accessible"
     }
   }
 }
+
