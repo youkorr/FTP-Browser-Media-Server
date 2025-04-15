@@ -67,24 +67,24 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     # Register services
     async def create_share_link(call):
         """Service to create a share link."""
-        # Si aucun entry_id n'est fourni, utiliser le premier disponible
         entry_id = call.data.get("entry_id")
-        if not entry_id and hass.data[DOMAIN]["entries"]:
-            # Prendre le premier entry_id disponible
-            entry_id = next(iter(hass.data[DOMAIN]["entries"].keys()))
-            _LOGGER.info(f"Aucun entry_id fourni, utilisation de: {entry_id}")
+        
+        # Si aucun entry_id n'est fourni, utiliser le premier disponible
+        if not entry_id:
+            if hass.data[DOMAIN]["entries"]:
+                # Prendre le premier entry_id disponible
+                entry_id = next(iter(hass.data[DOMAIN]["entries"].keys()))
+                _LOGGER.info(f"Aucun entry_id fourni, utilisation automatique de: {entry_id}")
+            else:
+                _LOGGER.error("Aucune configuration FTP disponible pour créer un lien de partage")
+                return {"error": "Aucune configuration FTP disponible"}
+        elif entry_id not in hass.data[DOMAIN]["entries"]:
+            _LOGGER.error(f"Config entry inconnue: {entry_id}")
+            return {"error": f"Config entry inconnue: {entry_id}"}
         
         path = call.data.get("path", "/")  # Chemin par défaut: racine
         duration = call.data.get("duration", 24)  # Durée par défaut: 24 heures
-        
-        if not entry_id:
-            _LOGGER.error("Aucune configuration FTP disponible pour créer un lien de partage")
-            return {"error": "Aucune configuration FTP disponible"}
-            
-        if entry_id not in hass.data[DOMAIN]["entries"]:
-            _LOGGER.error(f"Config entry inconnue: {entry_id}")
-            return {"error": f"Config entry inconnue: {entry_id}"}
-            
+                    
         entry_data = hass.data[DOMAIN]["entries"][entry_id]
         
         # Construct full path with root path
@@ -135,12 +135,13 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
             _LOGGER.warning(f"Lien de partage avec token {token} non trouvé")
             return {"success": False, "error": "Token non trouvé"}
     
+    # Modifié: schéma sans entry_id requis
     hass.services.async_register(
         DOMAIN, SERVICE_CREATE_SHARE, create_share_link,
         vol.Schema({
             vol.Optional("entry_id"): str,
-            vol.Optional("path"): str,
-            vol.Optional("duration"): int,
+            vol.Optional("path", default="/"): str,
+            vol.Optional("duration", default=24): int,
         })
     )
     
@@ -173,8 +174,6 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     )
     
     return True
-
-# Le reste du code reste inchangé
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up FTP Browser from a config entry."""
@@ -464,35 +463,34 @@ class FTPShareView(HomeAssistantView):
             return self.json_message("Invalid JSON", 400)
         
         entry_id = data.get("entry_id")
+        
         # Si aucun entry_id n'est fourni, utiliser le premier disponible
-        if not entry_id and hass.data[DOMAIN]["entries"]:
-            entry_id = next(iter(hass.data[DOMAIN]["entries"].keys()))
-            _LOGGER.info(f"Aucun entry_id fourni dans l'API, utilisation de: {entry_id}")
-            
+        if not entry_id:
+            if hass.data[DOMAIN]["entries"]:
+                entry_id = next(iter(hass.data[DOMAIN]["entries"].keys()))
+                _LOGGER.info(f"Aucun entry_id fourni dans l'API, utilisation automatique de: {entry_id}")
+            else:
+                return self.json_message("Aucune configuration FTP disponible", 400)
+                
+        elif entry_id not in hass.data[DOMAIN]["entries"]:
+            return self.json_message(f"Unknown config entry: {entry_id}", 404)
+        
         path = data.get("path", "/")
         duration = data.get("duration", 24)  # hours
-        
-        if not entry_id:
-            return self.json_message("Aucune configuration FTP disponible", 400)
-            
-        if entry_id not in hass.data[DOMAIN]["entries"]:
-            return self.json_message(f"Unknown config entry: {entry_id}", 404)
         
         entry_data = hass.data[DOMAIN]["entries"][entry_id]
         
         # Construct full path with root path if needed
         root_path = entry_data.get("root_path", DEFAULT_ROOT_PATH)
-        full_path = path
         
-        if root_path and root_path != "/":
-            # Remove leading slash from path if present
-            if path.startswith("/"):
-                path_no_slash = path[1:]
-            else:
-                path_no_slash = path
-                
-            # Join with root path
-            full_path = os.path.join(root_path, path_no_slash)
+        # Remove leading slash from path if present
+        if path.startswith("/"):
+            path_no_slash = path[1:]
+        else:
+            path_no_slash = path
+            
+        # Join with root path
+        full_path = os.path.normpath(os.path.join(root_path, path_no_slash))
         
         _LOGGER.debug(f"Creating share link for: {path} -> {full_path}")
         
